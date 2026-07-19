@@ -1,0 +1,17 @@
+venv/
+.venv/
+env/
+.env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.idea/
+.vscode/
+
+# Not part of this project's pip/pyproject workflow
+uv.lock

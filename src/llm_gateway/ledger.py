@@ -28,6 +28,8 @@ class CostLedger:
     def check_budget(self, tenant: str) -> None:
         budget = self._budgets.get(tenant)
         if budget is not None and self._spend[tenant].cost_usd >= budget:
+            # The comparison is against billed spend only; cached hits accrue
+            # saved_usd so dashboards show avoided cost without burning budget.
             raise RateLimited(
                 f"tenant '{tenant}' exhausted its ${budget:.2f} budget"
             )

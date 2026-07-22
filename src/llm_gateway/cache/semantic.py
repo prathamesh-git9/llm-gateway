@@ -85,6 +85,8 @@ class SemanticCache:
 
     @staticmethod
     def _key(namespace: str, prompt: str) -> str:
+        # Namespace is part of the digest, not just a lookup filter, so exact
+        # hits stay tenant/model-scoped even if a future store indexes by hash.
         return hashlib.sha256(f"{namespace}\x00{prompt}".encode()).hexdigest()
 
     def _evict_expired(self, now: float) -> None:

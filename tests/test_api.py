@@ -65,6 +65,8 @@ def test_upstream_failure_surfaces_as_5xx(client):
     resp = post(client, messages=[{"role": "user", "content": "__unavailable__ boom"}])
     assert resp.status_code == 503
     assert resp.json()["error"]["type"] == "NoRouteAvailable"
+    # A failed provider call releases its reservation and records no billed tenant.
+    assert "default" not in client.get("/v1/spend").json()
 
 
 def test_rate_limit_returns_429():
@@ -74,6 +76,21 @@ def test_rate_limit_returns_429():
             post(c, x_cache=False)
         resp = post(c, x_cache=False)
         assert resp.status_code == 429
+
+
+def test_hard_budget_rejects_before_provider_call():
+    settings = Settings(
+        providers=["echo"],
+        rate_limit_per_second=1000,
+        rate_limit_burst=1000,
+        budgets_usd={"small": 0.000001},
+    )
+    with TestClient(create_app(settings)) as c:
+        response = post(c, x_tenant="small", x_cache=False)
+        assert response.status_code == 429
+        spend = c.get("/v1/spend").json()["small"]
+        assert spend["cost_usd"] == 0
+        assert spend["reserved_usd"] == 0
 
 
 def test_spend_ledger_tracks_cost_and_savings(client):
@@ -95,6 +112,9 @@ def test_streaming_emits_sse_and_terminates(client):
     body = resp.text
     assert body.startswith("data: ")
     assert body.rstrip().endswith("data: [DONE]")
+    spend = client.get("/v1/spend").json()["default"]
+    assert spend["cost_usd"] > 0
+    assert spend["reserved_usd"] == 0
 
 
 def test_metrics_are_exposed(client):

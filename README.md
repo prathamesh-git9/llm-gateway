@@ -1,5 +1,5 @@
 # llm-gateway
-OpenAI-compatible LLM inference gateway with policy routing, fallback chains, circuit breakers, semantic caching, rate limiting, metrics, and per-tenant cost accounting.
+OpenAI-compatible LLM inference gateway with policy routing, fallback chains, circuit breakers, semantic caching, rate limiting, metrics, and hard per-tenant budgets.
 
 ## Why It Exists
 LLM applications often start with a direct call to one provider, then quickly need operational controls: failover when a model is degraded, spend visibility by tenant, request throttling, caching, and Prometheus metrics. `llm-gateway` centralizes those concerns behind an OpenAI-compatible API surface so clients can keep a stable integration while the gateway handles routing and reliability policy.
@@ -24,7 +24,7 @@ Core modules:
 - `src/llm_gateway/routing/router.py`: policy routing and fallback chains.
 - `src/llm_gateway/routing/breaker.py`: provider circuit breaker.
 - `src/llm_gateway/cache/semantic.py`: two-tier exact and vector cache.
-- `src/llm_gateway/ledger.py`: per-tenant cost accounting.
+- `src/llm_gateway/ledger.py`: concurrent cost reservations and per-tenant accounting.
 - `src/llm_gateway/ratelimit.py`: token bucket rate limiting.
 - `src/llm_gateway/metrics.py`: Prometheus instrumentation.
 - `src/llm_gateway/providers/echo.py`: no-network built-in provider for local development and tests.
@@ -35,7 +35,8 @@ Core modules:
 - Policy-based model routing with ordered fallback chains.
 - Circuit breaker around provider calls to avoid repeatedly selecting unhealthy providers.
 - Two-tier cache with exact lookup and vector similarity matching.
-- Per-tenant spend ledger for cost attribution.
+- Per-tenant spend ledger for cost attribution and atomic worst-case reservations
+  that prevent concurrent requests or fallbacks from oversubscribing a hard budget.
 - Token bucket rate limiting with configurable refill and burst capacity.
 - Prometheus metrics endpoint.
 - Built-in `echo-fast` provider for local, no-network verification.
@@ -88,6 +89,7 @@ Environment variables use the `GATEWAY_` prefix.
 | `GATEWAY_BREAKER_FAILURE_THRESHOLD` | Consecutive provider failures before opening a breaker. | `5` |
 | `GATEWAY_BREAKER_RECOVERY_SECONDS` | Seconds before an open breaker can probe recovery. | `30` |
 | `GATEWAY_RATE_LIMIT_PER_SECOND` | Token bucket refill rate per tenant. | `10` |
+| `GATEWAY_BUDGETS_USD` | JSON map of tenant IDs to hard USD ceilings. | `{"acme":25.0}` |
 | `GATEWAY_RATE_LIMIT_BURST` | Maximum burst tokens per tenant. | `50` |
 | `GATEWAY_PROVIDERS` | Enabled provider identifiers and routing targets. | `echo,anthropic` |
 | `GATEWAY_MAX_ATTEMPTS` | Maximum provider attempts across fallback chains. | `3` |

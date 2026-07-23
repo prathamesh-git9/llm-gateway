@@ -22,6 +22,7 @@ from llm_gateway.config import Settings
 from llm_gateway.errors import GatewayError, RateLimited
 from llm_gateway.ledger import CostLedger
 from llm_gateway.metrics import CACHE_EVENTS, COST, LATENCY, REQUESTS, TOKENS
+from llm_gateway.providers.base import estimate_tokens
 from llm_gateway.providers.echo import EchoProvider
 from llm_gateway.ratelimit import TokenBucketLimiter
 from llm_gateway.routing.breaker import State
@@ -75,7 +76,7 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
             ttl_seconds=settings.cache_ttl_seconds,
             threshold=settings.cache_similarity_threshold,
         )
-        app.state.ledger = CostLedger()
+        app.state.ledger = CostLedger(settings.budgets_usd)
         app.state.limiter = TokenBucketLimiter(
             settings.rate_limit_per_second, settings.rate_limit_burst
         )
@@ -125,6 +126,7 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
                 "completion_tokens": s.completion_tokens,
                 "cost_usd": round(s.cost_usd, 6),
                 "saved_usd": round(s.saved_usd, 6),
+                **state.ledger.budget_status(tenant),
             }
             for tenant, s in state.ledger.all_spend().items()
         }
@@ -133,8 +135,6 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
     async def chat_completions(req: ChatRequest, state=app_state):
         if not state.limiter.allow(req.x_tenant):
             raise RateLimited(f"rate limit exceeded for tenant '{req.x_tenant}'")
-        state.ledger.check_budget(req.x_tenant)
-
         if req.stream:
             return await _stream(req, state)
         return await _complete(req, state)
@@ -148,9 +148,7 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
             if hit is not None:
                 cached, tier = hit
                 CACHE_EVENTS.labels(tier=tier).inc()
-                REQUESTS.labels(
-                    model=req.model, provider="cache", outcome="hit"
-                ).inc()
+                REQUESTS.labels(model=req.model, provider="cache", outcome="hit").inc()
                 state.ledger.record(
                     req.x_tenant,
                     prompt_tokens=cached.usage.prompt_tokens,
@@ -170,12 +168,15 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
                 )
             CACHE_EVENTS.labels(tier="miss").inc()
 
+        reservation = state.ledger.reserve(
+            req.x_tenant,
+            _maximum_request_cost(req, state.router, state.settings.max_attempts),
+        )
         try:
             result = await state.router.route(req)
         except GatewayError:
-            REQUESTS.labels(
-                model=req.model, provider="none", outcome="error"
-            ).inc()
+            state.ledger.release(reservation)
+            REQUESTS.labels(model=req.model, provider="none", outcome="error").inc()
             raise
 
         usage = result.response.usage
@@ -187,15 +188,12 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
         ).inc()
         COST.labels(tenant=req.x_tenant, model=result.model).inc(usage.cost_usd)
         TOKENS.labels(model=result.model, kind="prompt").inc(usage.prompt_tokens)
-        TOKENS.labels(model=result.model, kind="completion").inc(
-            usage.completion_tokens
-        )
-        state.ledger.record(
-            req.x_tenant,
+        TOKENS.labels(model=result.model, kind="completion").inc(usage.completion_tokens)
+        state.ledger.settle(
+            reservation,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             cost_usd=usage.cost_usd,
-            cached=False,
         )
 
         response = result.response.model_copy(
@@ -220,21 +218,45 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
             raise GatewayError(f"no provider serves model '{req.model}'")
         candidate = chain[0]
         upstream = req.model_copy(update={"model": candidate.spec.name})
+        reservation = state.ledger.reserve(
+            req.x_tenant,
+            _maximum_request_cost(req, state.router, state.settings.max_attempts),
+        )
 
         async def sse():
             # Streaming intentionally does not fall back mid-response: once the
             # first token is on the wire, switching providers would splice two
             # different completions together. Failures surface as an SSE error
             # event and the client decides whether to retry.
+            chunks: list[str] = []
+            completed = False
             try:
                 async for chunk in candidate.provider.stream(upstream):
+                    chunks.append(chunk)
                     payload = {
                         "choices": [{"index": 0, "delta": {"content": chunk}}],
                         "model": candidate.spec.name,
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
+                completed = True
             except GatewayError as exc:
                 yield f"data: {json.dumps({'error': exc.message})}\n\n"
+            finally:
+                if completed:
+                    prompt_tokens = estimate_tokens(req.prompt_text())
+                    completion_tokens = estimate_tokens("".join(chunks))
+                    cost = candidate.spec.pricing.cost(
+                        prompt_tokens,
+                        completion_tokens,
+                    )
+                    state.ledger.settle(
+                        reservation,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        cost_usd=cost,
+                    )
+                else:
+                    state.ledger.release(reservation)
             yield "data: [DONE]\n\n"
 
         REQUESTS.labels(
@@ -246,3 +268,19 @@ def create_app(settings: Settings | None = None, **overrides) -> FastAPI:
 
 
 app = create_app()
+
+
+def _maximum_request_cost(
+    req: ChatRequest,
+    router: Router,
+    max_attempts: int,
+) -> float:
+    """Return a conservative upper bill across every eligible fallback."""
+    candidates = router.candidates(req.model)[:max_attempts]
+    if not candidates:
+        return 0.0
+    prompt_upper_bound = max(1, len(req.prompt_text().encode("utf-8")))
+    return max(
+        candidate.spec.pricing.cost(prompt_upper_bound, req.max_tokens)
+        for candidate in candidates
+    )

@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from llm_gateway.errors import RateLimited
@@ -59,3 +61,46 @@ def test_cached_requests_accrue_savings_not_spend():
     assert spend.cost_usd == 0
     assert spend.saved_usd == 0.5
     assert spend.cached_requests == 1
+
+
+def test_concurrent_reservations_cannot_oversubscribe_budget():
+    ledger = CostLedger(budgets_usd={"acme": 0.01})
+
+    def reserve():
+        try:
+            return ledger.reserve("acme", 0.007)
+        except RateLimited:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reservations = list(pool.map(lambda _: reserve(), range(2)))
+
+    accepted = [item for item in reservations if item is not None]
+    assert len(accepted) == 1
+    assert ledger.budget_status("acme")["reserved_usd"] == pytest.approx(0.007)
+    ledger.release(accepted[0])
+
+
+def test_settlement_is_single_use_and_cannot_exceed_reservation():
+    ledger = CostLedger(budgets_usd={"acme": 1.0})
+    reservation = ledger.reserve("acme", 0.25)
+    with pytest.raises(ValueError, match="exceeded"):
+        ledger.settle(
+            reservation,
+            prompt_tokens=1,
+            completion_tokens=1,
+            cost_usd=0.26,
+        )
+    ledger.settle(
+        reservation,
+        prompt_tokens=10,
+        completion_tokens=5,
+        cost_usd=0.2,
+    )
+    with pytest.raises(ValueError, match="already settled"):
+        ledger.settle(
+            reservation,
+            prompt_tokens=10,
+            completion_tokens=5,
+            cost_usd=0.2,
+        )

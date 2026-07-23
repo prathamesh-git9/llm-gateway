@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     rate_limit_per_second: float = 20.0
     rate_limit_burst: int = 40
 
+    # JSON environment value, e.g. GATEWAY_BUDGETS_USD='{"acme": 25.0}'.
+    # Reservations make this a concurrent hard ceiling, not an alert after spend.
+    budgets_usd: dict[str, float] = Field(default_factory=dict)
+
     # Enabled providers. 'echo' is the built-in no-network provider and is the
     # default so a fresh clone boots and serves traffic with zero credentials.
     providers: list[str] = Field(default_factory=lambda: ["echo"])
